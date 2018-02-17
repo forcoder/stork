@@ -73,7 +73,7 @@ errcheck:
 pretest: lint vet errcheck
 
 test:
-	go test -tags unittest $(TESTFLAGS) $(PKGS)
+	go test -v -tags unittest $(TESTFLAGS) $(PKGS)
 
 integration-test:
 	@echo "Building stork integration tests"
