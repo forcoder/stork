@@ -11,8 +11,18 @@ import (
 
 	"github.com/libopenstorage/stork/drivers/volume"
 	storklog "github.com/libopenstorage/stork/pkg/log"
+	"github.com/sirupsen/logrus"
 	log "github.com/sirupsen/logrus"
 	"k8s.io/api/core/v1"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/fields"
+	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
+	"k8s.io/apimachinery/pkg/util/strategicpatch"
+	"k8s.io/apimachinery/pkg/watch"
+	"k8s.io/client-go/kubernetes"
+	"k8s.io/client-go/rest"
+	"k8s.io/client-go/tools/cache"
 	schedulerapi "k8s.io/kubernetes/plugin/pkg/scheduler/api"
 )
 
@@ -23,14 +33,18 @@ const (
 	priorityScore = 100
 	// defaultScore Score assigned to a node which doesn't have data for any volume
 	defaultScore = 10
+
+	storkInitializerName = "stork.initializer.kubernetes.io"
+	storkSchedulerName   = "stork"
 )
 
 // Extender Scheduler extender
 type Extender struct {
-	Driver  volume.Driver
-	server  *http.Server
-	lock    sync.Mutex
-	started bool
+	Driver      volume.Driver
+	server      *http.Server
+	lock        sync.Mutex
+	started     bool
+	stopChannel chan struct{}
 }
 
 // Start Starts the extender
@@ -51,6 +65,48 @@ func (e *Extender) Start() error {
 			log.Panicf("Error starting extender server: %v", err)
 		}
 	}()
+
+	config, err := rest.InClusterConfig()
+	if err != nil {
+		log.Errorf("Error getting cluster config: %v", err)
+		return err
+	}
+
+	k8sClient, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		log.Errorf("Error getting client, %v", err)
+		return err
+	}
+
+	restClient := k8sClient.CoreV1().RESTClient()
+	podsWatchlist := cache.NewListWatchFromClient(restClient, "pods", v1.NamespaceAll, fields.Everything())
+
+	includeUninitializedWatchlist := &cache.ListWatch{
+		ListFunc: func(options metav1.ListOptions) (runtime.Object, error) {
+			options.IncludeUninitialized = true
+			return podsWatchlist.List(options)
+		},
+		WatchFunc: func(options metav1.ListOptions) (watch.Interface, error) {
+			options.IncludeUninitialized = true
+			return podsWatchlist.Watch(options)
+		},
+	}
+
+	resyncPeriod := 30 * time.Second
+
+	_, initController := cache.NewInformer(includeUninitializedWatchlist, &v1.Pod{}, resyncPeriod,
+		cache.ResourceEventHandlerFuncs{
+			AddFunc: func(obj interface{}) {
+				err := e.initializeApp(obj, k8sClient)
+				if err != nil {
+					logrus.Errorf("Error initializing pod: %v", err)
+				}
+			},
+		},
+	)
+
+	e.stopChannel = make(chan struct{})
+	go initController.Run(e.stopChannel)
 	e.started = true
 	return nil
 }
@@ -70,6 +126,7 @@ func (e *Extender) Stop() error {
 	if err := e.server.Shutdown(ctx); err != nil {
 		return err
 	}
+	close(e.stopChannel)
 	e.started = false
 	return nil
 }
@@ -258,4 +315,66 @@ func (e *Extender) processPrioritizeRequest(w http.ResponseWriter, req *http.Req
 		storklog.PodLog(pod).Fatalf("Failed to encode response: %v", err)
 	}
 	return
+}
+
+func (e *Extender) initializePod(pod *v1.Pod, clientset *kubernetes.Clientset) error {
+	if pod.ObjectMeta.GetInitializers() == nil {
+		return nil
+	}
+
+	pendingInitializers := pod.ObjectMeta.GetInitializers().Pending
+	if storkInitializerName != pendingInitializers[0].Name {
+		return nil
+	}
+
+	driverVolumes, err := e.Driver.GetPodVolumes(pod)
+	if err != nil {
+		if _, ok := err.(*volume.ErrPVCPending); !ok {
+			storklog.PodLog(pod).Infof("Error getting volumes for pod: %v", err)
+			return err
+		}
+	} else if len(driverVolumes) == 0 {
+		return nil
+	}
+
+	oldData, err := json.Marshal(pod)
+	if err != nil {
+		return err
+	}
+
+	o, err := runtime.NewScheme().DeepCopy(pod)
+	if err != nil {
+		return err
+	}
+	updatedPod := o.(*v1.Pod)
+
+	if len(pendingInitializers) == 1 {
+		updatedPod.ObjectMeta.Initializers.Pending = nil
+	} else if len(pendingInitializers) > 1 {
+		updatedPod.ObjectMeta.Initializers.Pending = append(pendingInitializers[:0], pendingInitializers[1:]...)
+	}
+
+	updatedPod.Spec.SchedulerName = "stork"
+	newData, err := json.Marshal(updatedPod)
+	if err != nil {
+		return err
+	}
+
+	patchBytes, err := strategicpatch.CreateTwoWayMergePatch(oldData, newData, v1.Pod{})
+	if err != nil {
+		return err
+	}
+
+	_, err = clientset.CoreV1().Pods(pod.Namespace).Patch(pod.Name, types.StrategicMergePatchType, patchBytes)
+	if err != nil {
+		return err
+	}
+	return nil
+}
+
+func (e *Extender) initializeApp(obj interface{}, clientset *kubernetes.Clientset) error {
+	if pod, ok := obj.(*v1.Pod); ok {
+		return e.initializePod(pod, clientset)
+	}
+	return fmt.Errorf("invalid app type: %v", obj)
 }
